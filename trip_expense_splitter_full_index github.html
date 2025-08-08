@@ -1,0 +1,333 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Trip Expense Splitter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-sky-50 to-indigo-50 text-slate-800">
+  <div id="root" class="p-4 md:p-8"></div>
+  <script type="module">
+    import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18";
+    import { createRoot } from "https://esm.sh/react-dom@18/client";
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    // Prefilled with your Supabase project
+    const DEFAULT_URL = "https://yjqlbckjhpkyivtfdmau.supabase.co";
+    const DEFAULT_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlqcWxiY2tqaHBreWl2dGZkbWF1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ2NzcwMjYsImV4cCI6MjA3MDI1MzAyNn0.RS2jKbNl6o4NoewNH-1gdvrQPkpuZnpo4WxXh4BZKLk";
+
+    const STORAGE_KEY = "trip_expense_splitter_v2";
+    const CLOUD_KEY   = "trip_expense_cloud_v2";
+
+    const clamp = (n,a,b)=>Math.max(a,Math.min(b,n));
+    const uid = ()=>Math.random().toString(36).slice(2)+Date.now().toString(36);
+    const money=(n,code)=>{
+      try { return new Intl.NumberFormat(undefined,{ style:"currency", currency: code }).format(n); }
+      catch { return new Intl.NumberFormat(undefined,{ style:"currency", currency: "USD" }).format(n); }
+    };
+
+    const DEFAULT_DATA = {
+      youName:"You", partnerName:"Partner", currency:"USD",
+      sections:[
+        { id:uid(), name:"Flights", txns:[{ id:uid(), label:"DAL to DEN", amount:320, date:new Date().toISOString().slice(0,10), status:"upcoming", plan:"split", splitPercentYou:50, note:"Southwest" }] },
+        { id:uid(), name:"Lodging", txns:[{ id:uid(), label:"Hotel", amount:780, date:new Date().toISOString().slice(0,10), status:"upcoming", plan:"individual", payer:"You", note:"3 nights" }] }
+      ]
+    };
+
+    function App(){
+      const [data,setData]=useState(()=>{ try{ return JSON.parse(localStorage.getItem(STORAGE_KEY))||DEFAULT_DATA } catch { return DEFAULT_DATA } });
+      const [cloud,setCloud]=useState(()=>{ try{ return JSON.parse(localStorage.getItem(CLOUD_KEY))||{url:DEFAULT_URL,key:DEFAULT_KEY,tripId:"",tripName:"Our Trip",enabled:true,status:"disconnected"} } catch { return {url:DEFAULT_URL,key:DEFAULT_KEY,tripId:"",tripName:"Our Trip",enabled:true,status:"disconnected"} } });
+      useEffect(()=>localStorage.setItem(STORAGE_KEY,JSON.stringify(data)),[data]);
+      useEffect(()=>localStorage.setItem(CLOUD_KEY,JSON.stringify(cloud)),[cloud]);
+
+      const supaRef=useRef(null); const subRef=useRef(null);
+      const isReady = cloud.enabled && cloud.url && cloud.key && cloud.tripId;
+
+      // init supabase
+      useEffect(()=>{ if(!cloud.enabled||!cloud.url||!cloud.key) return; supaRef.current=createClient(cloud.url,cloud.key); },[cloud.enabled,cloud.url,cloud.key]);
+
+      // auto trip id
+      useEffect(()=>{ if(cloud.enabled && cloud.url && cloud.key && !cloud.tripId) setCloud(c=>({...c,tripId:crypto.randomUUID()})); },[cloud.enabled,cloud.url,cloud.key,cloud.tripId]);
+
+      // load + subscribe
+      useEffect(()=>{
+        const supa=supaRef.current; if(!supa||!isReady) return;
+        setCloud(c=>({...c,status:"connecting"}));
+        (async()=>{
+          const {data:row,error}=await supa.from("trip_data").select("id,name,data,updated_at").eq("id",cloud.tripId).maybeSingle();
+          if(error){ console.error(error); setCloud(c=>({...c,status:"error"})); return; }
+          if(row){
+            try{
+              const remote=row.data;
+              setData(local=> remote && Array.isArray(remote.sections) && remote.sections.length>=local.sections.length ? remote : local );
+            }catch{}
+          }else{
+            await supa.from("trip_data").insert({id:cloud.tripId,name:cloud.tripName||"Our Trip",data});
+          }
+          setCloud(c=>({...c,status:"connected",lastSync:new Date().toISOString()}));
+          if(subRef.current) supa.removeChannel(subRef.current);
+          subRef.current = supa.channel("trip_"+cloud.tripId)
+            .on("postgres_changes",{event:"UPDATE",schema:"public",table:"trip_data",filter:`id=eq.${cloud.tripId}`},(payload)=>{
+              const next=payload.new?.data; if(next) setData(next);
+              setCloud(c=>({...c,lastSync:new Date().toISOString()}));
+            }).subscribe();
+        })();
+        return ()=>{ if(subRef.current&&supa) supa.removeChannel(subRef.current); };
+      },[isReady,cloud.tripId]);
+
+      // push changes
+      useEffect(()=>{
+        const supa=supaRef.current; if(!supa||!isReady||cloud.status!=="connected") return;
+        const t=setTimeout(async()=>{
+          await supa.from("trip_data").update({data,name:cloud.tripName}).eq("id",cloud.tripId);
+          setCloud(c=>({...c,lastSync:new Date().toISOString()}));
+        },350);
+        return ()=>clearTimeout(t);
+      },[data,cloud.tripName,isReady,cloud.status]);
+
+      const totals = useMemo(()=>{
+        let total=0,up=0,paid=0,youS=0,partS=0;
+        for(const s of data.sections) for(const t of s.txns){
+          total+=t.amount; (t.status==="paid"?paid:up)+=t.amount;
+          if(t.plan==="split"){ const p=clamp(t.splitPercentYou??50,0,100)/100; youS+=t.amount*p; partS+=t.amount*(1-p); }
+          else { t.payer==="You"? youS+=t.amount : partS+=t.amount; }
+        }
+        return { total, up, paid, youS, partS };
+      },[data.sections]);
+
+      const you=data.youName||"You", partner=data.partnerName||"Partner";
+      const fmt=(n)=>money(n,data.currency);
+
+      return (
+        React.createElement("div",{className:"max-w-6xl mx-auto space-y-6"},
+          React.createElement(Header,{data,setData}),
+          React.createElement(CloudBar,{cloud,setCloud,isReady}),
+          React.createElement(Summary,{totals,fmt,you,partner}),
+          React.createElement(Controls,{data,setData}),
+          React.createElement(SectionList,{data,setData,fmt,you,partner}),
+          React.createElement(Footer,{data,setData})
+        )
+      );
+    }
+
+    function Header({data,setData}){
+      return (
+        React.createElement("div",{className:"flex flex-col md:flex-row md:items-end md:justify-between gap-4"},
+          React.createElement("div",null,
+            React.createElement("h1",{className:"text-2xl md:text-3xl font-semibold tracking-tight"},"Trip Expense Splitter"),
+            React.createElement("p",{className:"text-sm text-slate-600"},"Local first. Optional Supabase sync for real time sharing.")
+          ),
+          React.createElement("div",{className:"grid grid-cols-2 md:grid-cols-4 gap-3 bg-white/70 backdrop-blur rounded-xl p-4 shadow-sm"},
+            React.createElement(LabeledInput,{label:"Your Name",value:data.youName,onChange:(v)=>setData(d=>({...d,youName:v})),placeholder:"Your name"}),
+            React.createElement(LabeledInput,{label:"Partner Name",value:data.partnerName,onChange:(v)=>setData(d=>({...d,partnerName:v})),placeholder:"Partner name"}),
+            React.createElement(LabeledInput,{label:"Currency Code",value:data.currency,onChange:(v)=>setData(d=>({...d,currency:v.toUpperCase().slice(0,3)})),placeholder:"USD"}),
+            React.createElement("button",{className:"self-end inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90",onClick:()=>setData(DEFAULT_DATA),title:"Load example data"},"Load Sample")
+          )
+        )
+      );
+    }
+
+    function CloudBar({cloud,setCloud,isReady}){
+      const createTrip = ()=>setCloud(c=>({...c,tripId:crypto.randomUUID(),enabled:true}));
+      const connect    = ()=>setCloud(c=>({...c,enabled:true}));
+      const disconnect = ()=>setCloud(c=>({...c,enabled:false,status:"disconnected"}));
+      return (
+        React.createElement("div",{className:"bg-white rounded-xl p-4 shadow-sm space-y-3"},
+          React.createElement("div",{className:"flex items-center justify-between gap-3"},
+            React.createElement("div",{className:"flex items-center gap-2"},
+              React.createElement("span",{className:`inline-flex items-center rounded-full border px-2 py-1 text-xs ${cloud.status==="connected"?"bg-emerald-50 text-emerald-700 border-emerald-200":cloud.status==="connecting"?"bg-amber-50 text-amber-700 border-amber-200":cloud.status==="error"?"bg-red-50 text-red-700 border-red-200":"bg-slate-50 text-slate-700 border-slate-200"}`},cloud.status||"disconnected"),
+              cloud.lastSync?React.createElement("span",{className:"text-xs text-slate-500"},"Last sync ",new Date(cloud.lastSync).toLocaleTimeString()):null
+            ),
+            isReady
+              ? React.createElement("div",{className:"flex items-center gap-2"},
+                  React.createElement("button",{className:"inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90",onClick:disconnect},"Disconnect"),
+                  React.createElement("div",{className:"text-xs text-slate-600"},"Trip Code: ",React.createElement("code",{className:"bg-slate-100 px-1 py-0.5 rounded"},cloud.tripId)))
+              : React.createElement("div",{className:"flex items-center gap-2"},
+                  React.createElement("button",{className:"inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90",onClick:connect},"Connect"),
+                  React.createElement("button",{className:"inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90",onClick:createTrip},"Create Trip"))
+          ),
+          React.createElement("div",{className:"grid grid-cols-1 md:grid-cols-5 gap-3"},
+            React.createElement(LabeledInput,{label:"Supabase URL",value:cloud.url,onChange:(v)=>setCloud(c=>({...c,url:v})),placeholder:"https://YOUR-PROJECT.supabase.co"}),
+            React.createElement(LabeledInput,{label:"Supabase Anon Key",value:cloud.key,onChange:(v)=>setCloud(c=>({...c,key:v})),placeholder:"ey..."}),
+            React.createElement(LabeledInput,{label:"Trip Name",value:cloud.tripName,onChange:(v)=>setCloud(c=>({...c,tripName:v})),placeholder:"Our Trip"}),
+            React.createElement(LabeledInput,{label:"Join With Trip Code",value:cloud.tripId,onChange:(v)=>setCloud(c=>({...c,tripId:v})),placeholder:"paste UUID"}),
+            React.createElement("div",{className:"flex items-end"},
+              React.createElement("div",{className:"text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-2 w-full"},
+                React.createElement("div",{className:"font-medium mb-1"},"Sharing"),
+                React.createElement("ul",{className:"list-disc ml-5 space-y-1"},
+                  React.createElement("li",null,"Send your partner the app link and your Trip Code",cloud.tripId?` (${cloud.tripId})`:""),
+                  React.createElement("li",null,"Both of you enter the same Supabase credentials."),
+                  React.createElement("li",null,"Edit anywhere. Both screens update in a moment.")
+                )
+              )
+            )
+          ),
+          React.createElement("p",{className:"text-xs text-slate-500"},"Both of you paste the same Supabase URL and Anon Key, then share the Trip Code. One person can click Create Trip to generate a code, the other person pastes it to join. Changes sync automatically.")
+        )
+      );
+    }
+
+    function Summary({totals,fmt,you,partner}){
+      const Item = ({label,value}) => (
+        React.createElement("div",{className:"flex flex-col bg-white rounded-xl p-4 shadow-sm"},
+          React.createElement("span",{className:"text-xs uppercase tracking-wide text-slate-500"},label),
+          React.createElement("span",{className:"text-xl font-semibold"},value)
+        )
+      );
+      return (
+        React.createElement("div",{className:"grid grid-cols-2 md:grid-cols-5 gap-3"},
+          React.createElement(Item,{label:"Total",value:fmt(totals.total)}),
+          React.createElement(Item,{label:"Upcoming",value:fmt(totals.up)}),
+          React.createElement(Item,{label:"Paid",value:fmt(totals.paid)}),
+          React.createElement(Item,{label:`${you} Share`,value:fmt(totals.youS)}),
+          React.createElement(Item,{label:`${partner} Share`,value:fmt(totals.partS)})
+        )
+      );
+    }
+
+    function Controls({data,setData}){
+      return (
+        React.createElement("div",{className:"flex flex-col md:flex-row items-start md:items-end justify-between gap-3 bg-white rounded-xl p-4 shadow-sm"},
+          React.createElement("div",{className:"flex flex-wrap gap-3"},
+            React.createElement("button",{className:"inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90",onClick:()=>setData(d=>({...d,sections:[...d.sections,{id:uid(),name:"New Section",txns:[]}]}))},"+ Add Section")
+          )
+        )
+      );
+    }
+
+    function SectionList({data,setData,fmt,you,partner}){
+      return (
+        React.createElement("div",{className:"space-y-4"},
+          data.sections.map(s => React.createElement(SectionCard,{key:s.id,s,setData,fmt,you,partner})),
+          data.sections.length===0 ? React.createElement("div",{className:"text-center text-slate-500 text-sm"},"No items yet. Add a section to get started.") : null
+        )
+      );
+    }
+
+    function SectionCard({s,setData,fmt,you,partner}){
+      const totals = useMemo(()=>{
+        let total=0, upcoming=0, paid=0;
+        for(const t of s.txns){ total+=t.amount; (t.status==="paid"?paid:upcoming)+=t.amount; }
+        return { total, upcoming, paid };
+      },[s.txns]);
+
+      const rename = (name)=>setData(d=>({...d,sections:d.sections.map(x=>x.id===s.id?{...x,name}:x)}));
+      const addTxn = ()=>setData(d=>({...d,sections:d.sections.map(x=>x.id===s.id?{...x,txns:[...x.txns,{id:uid(),label:"New Item",amount:0,status:"upcoming",plan:"split",splitPercentYou:50}]}:x)}));
+      const delSec = ()=>setData(d=>({...d,sections:d.sections.filter(x=>x.id!==s.id)}));
+      const move = (dir)=>setData(d=>{ const i=d.sections.findIndex(x=>x.id===s.id); const j=i+dir; if(j<0||j>=d.sections.length) return d; const arr=[...d.sections]; const [sp]=arr.splice(i,1); arr.splice(j,0,sp); return {...d,sections:arr}; });
+
+      return (
+        React.createElement("div",{className:"bg-white rounded-xl shadow-sm p-4"},
+          React.createElement("div",{className:"flex flex-col md:flex-row md:items-center justify-between gap-3 mb-3"},
+            React.createElement("div",{className:"flex items-center gap-2"},
+              React.createElement("input",{value:s.name,onChange:(e)=>rename(e.target.value),className:"text-lg font-semibold bg-transparent rounded px-2 py-1 hover:bg-slate-50 focus:bg-slate-50 focus:outline-none"}),
+              React.createElement("span",{className:"text-xs text-slate-500"},s.txns.length," items")
+            ),
+            React.createElement("div",{className:"flex items-center gap-2 text-sm"},
+              React.createElement("span",{className:"inline-flex items-center rounded-full border px-2 py-1 text-xs bg-slate-50 text-slate-700 border-slate-200"},"Total ",fmt(totals.total)),
+              React.createElement("span",{className:"inline-flex items-center rounded-full border px-2 py-1 text-xs bg-amber-50 text-amber-700 border-amber-200"},"Upcoming ",fmt(totals.upcoming)),
+              React.createElement("span",{className:"inline-flex items-center rounded-full border px-2 py-1 text-xs bg-emerald-50 text-emerald-700 border-emerald-200"},"Paid ",fmt(totals.paid)),
+              React.createElement("div",{className:"flex items-center gap-1"},
+                React.createElement("button",{className:"inline-flex items-center justify-center rounded px-2 py-1 hover:bg-slate-100",title:"Move up",onClick:()=>move(-1)},"⬆️"),
+                React.createElement("button",{className:"inline-flex items-center justify-center rounded px-2 py-1 hover:bg-slate-100",title:"Move down",onClick:()=>move(1)},"⬇️"),
+                React.createElement("button",{className:"inline-flex items-center justify-center rounded px-2 py-1 hover:bg-slate-100",title:"Delete section",onClick:delSec},"🗑️")
+              )
+            )
+          ),
+          React.createElement("div",{className:"space-y-2"},
+            s.txns.map(t => React.createElement(TxnRow,{key:t.id,sectionId:s.id,txn:t,setData,fmt,you,partner})),
+            s.txns.length===0 ? React.createElement("div",{className:"text-sm text-slate-500"},"No transactions in this section") : null
+          ),
+          React.createElement("div",{className:"mt-3"},
+            React.createElement("button",{className:"inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90",onClick:addTxn},"+ Add Transaction")
+          )
+        )
+      );
+    }
+
+    function TxnRow({sectionId,txn,setData,fmt,you,partner}){
+      const update = (patch)=>setData(d=>({...d,sections:d.sections.map(s=>s.id===sectionId?{...s,txns:s.txns.map(x=>x.id===txn.id?{...x,...patch}:x)}:s)}));
+      const remove = ()=>setData(d=>({...d,sections:d.sections.map(s=>s.id===sectionId?{...s,txns:s.txns.filter(x=>x.id!==txn.id)}:s)}));
+      const shares = useMemo(()=>{
+        if(txn.plan==="split"){ const p=clamp(txn.splitPercentYou??50,0,100)/100; return { you: txn.amount*p, partner: txn.amount*(1-p) }; }
+        return txn.payer==="You"?{you:txn.amount,partner:0}:{you:0,partner:txn.amount};
+      },[txn]);
+      return (
+        React.createElement("div",{className:"grid grid-cols-1 md:grid-cols-12 gap-2 items-start bg-slate-50 rounded-lg p-3"},
+          React.createElement("input",{className:"md:col-span-2 rounded border border-slate-200 px-2 py-1 bg-white",placeholder:"Label",value:txn.label,onChange:(e)=>update({label:e.target.value})}),
+          React.createElement("input",{type:"number",step:"0.01",className:"md:col-span-2 rounded border border-slate-200 px-2 py-1 bg-white",placeholder:"Amount",value:txn.amount,onChange:(e)=>update({amount:parseFloat(e.target.value)||0})}),
+          React.createElement("input",{type:"date",className:"md:col-span-2 rounded border border-slate-200 px-2 py-1 bg-white",value:txn.date||"",onChange:(e)=>update({date:e.target.value})}),
+          React.createElement("select",{className:"md:col-span-2 rounded border border-slate-200 px-2 py-1 bg-white",value:txn.status,onChange:(e)=>update({status:e.target.value})},
+            React.createElement("option",{value:"upcoming"},"Upcoming"),
+            React.createElement("option",{value:"paid"},"Paid")
+          ),
+          React.createElement("select",{className:"md:col-span-2 rounded border border-slate-200 px-2 py-1 bg-white",value:txn.plan,onChange:(e)=>update({plan:e.target.value})},
+            React.createElement("option",{value:"split"},"Split"),
+            React.createElement("option",{value:"individual"},"Individual")
+          ),
+          txn.plan==="split"
+            ? React.createElement("div",{className:"md:col-span-2 flex items-center gap-2"},
+                React.createElement("label",{className:"text-xs text-slate-600"},you," %"),
+                React.createElement("input",{type:"number",className:"w-20 rounded border border-slate-200 px-2 py-1 bg-white",value:clamp(txn.splitPercentYou??50,0,100),onChange:(e)=>update({splitPercentYou:clamp(parseFloat(e.target.value)||0,0,100)})}),
+                React.createElement("span",{className:"text-xs text-slate-600"},partner," ",100 - clamp(txn.splitPercentYou??50,0,100),"%")
+              )
+            : React.createElement("select",{className:"md:col-span-2 rounded border border-slate-200 px-2 py-1 bg-white",value:txn.payer||"You",onChange:(e)=>update({payer:e.target.value})},
+                React.createElement("option",{value:"You"},you),
+                React.createElement("option",{value:"Partner"},partner)
+              ),
+          React.createElement("div",{className:"md:col-span-3 flex flex-col bg-white rounded border border-slate-200 p-2"},
+            React.createElement("label",{className:"text-xs text-slate-600"},"Notes"),
+            React.createElement("textarea",{className:"resize-none outline-none",rows:2,placeholder:"Add details",value:txn.note||"",onChange:(e)=>update({note:e.target.value})})
+          ),
+          React.createElement("div",{className:"md:col-span-3 flex items-center gap-2"},
+            React.createElement("span",{className:"inline-flex items-center rounded-full border px-2 py-1 text-xs bg-slate-50 text-slate-700 border-slate-200"},"You ",fmt(shares.you)),
+            React.createElement("span",{className:"inline-flex items-center rounded-full border px-2 py-1 text-xs bg-slate-50 text-slate-700 border-slate-200"},partner," ",fmt(shares.partner)),
+            React.createElement("button",{className:"inline-flex items-center justify-center rounded px-2 py-1 hover:bg-slate-100 ml-auto",title:"Delete",onClick:remove},"🗑️")
+          )
+        )
+      );
+    }
+
+    function Footer({data,setData}){
+      const exportJson = ()=>{
+        const blob = new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "trip-expense.json"; a.click(); URL.revokeObjectURL(url);
+      };
+      const onImport = (e)=>{
+        const file = e.target.files?.[0]; if(!file) return;
+        const reader = new FileReader();
+        reader.onload = ()=>{ try{ setData(JSON.parse(String(reader.result))); } catch { alert("Invalid JSON"); } };
+        reader.readAsText(file);
+      };
+      return (
+        React.createElement("div",{className:"flex flex-col md:flex-row items-start md:items-center justify-between gap-3 bg-white rounded-xl p-4 shadow-sm mt-6"},
+          React.createElement("div",{className:"text-sm text-slate-600"},"Local save enabled. Export to back up. Cloud sync optional with Supabase."),
+          React.createElement("div",{className:"flex items-center gap-2"},
+            React.createElement("button",{className:"inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90",onClick:exportJson},"Export JSON"),
+            React.createElement("label",{className:"inline-flex items-center justify-center rounded-lg px-3 py-2 bg-slate-900 text-white text-sm shadow hover:opacity-90 cursor-pointer"},
+              "Import JSON",
+              React.createElement("input",{type:"file",accept:"application/json",className:"hidden",onChange:onImport})
+            )
+          )
+        )
+      );
+    }
+
+    function LabeledInput({label,value,onChange,placeholder}){
+      return (
+        React.createElement("label",{className:"text-sm w-full"},
+          React.createElement("div",{className:"text-xs text-slate-500 mb-1"},label),
+          React.createElement("input",{className:"rounded-lg border border-slate-200 px-3 py-2 w-full focus:outline-none focus:ring focus:ring-sky-200",value:value,placeholder:placeholder,onChange:(e)=>onChange(e.target.value)})
+        )
+      );
+    }
+
+    const root = createRoot(document.getElementById("root"));
+    root.render(React.createElement(App));
+  </script>
+</body>
+</html>
